@@ -5,12 +5,12 @@ from visualizer import viz_utils
 
 from argparse import ArgumentParser
 
-from code_hw_answers.code_hw1 import mrp, dynamic_programming, model_free
+from code_hw.code_hw1 import mrp, dynamic_programming, model_free
 from numpy.typing import NDArray
+import numpy as np
 
 import pickle
 import numpy as np
-
 
 def main():
     parser: ArgumentParser = ArgumentParser()
