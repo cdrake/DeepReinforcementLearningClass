@@ -7,6 +7,7 @@ import numpy as np
 class QNetwork(nn.Module):
     def __init__(self, input_dim: int = 81, num_actions: int = 4):
         super().__init__()
+        # Cribbed from run_hw3.py
         self.net = nn.Sequential(
             nn.Linear(input_dim, 200),
             nn.ReLU(),
@@ -51,7 +52,7 @@ def deep_rl(env: Environment) -> nn.Module:
     epochs_per_iter = 10
 
     for outer in range(num_outer):
-        # Curriculum: start with easy states, gradually increase difficulty
+        # Start with easy states, gradually increase difficulty (from beginning of class discussion 2/23)
         max_scramble = min(5 + outer * 2, 100)
         states = env.generate_states(states_per_iter, (0, max_scramble))
 
