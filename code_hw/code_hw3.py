@@ -1,51 +1,17 @@
 # Speed-Optimized A* Search
 #
-# Starting from a standard batched A* (batch=16) with h(s) = -max(Q(s,a)),
-# which ran at ~8.4s, 100% solved, ~91% optimal, we applied the following
-# optimizations to maximize speed while keeping 100% solved and >=50% optimal:
-#
-# 1. torch.jit.trace with cross-call caching: JIT-compile the nnet once and
-#    reuse it across all search() invocations via a module-level cache keyed
-#    on model id. Profiling showed JIT tracing costs ~17ms per call -- at 149
-#    test states, that was 2.5s of pure overhead before caching.
-#
-# 2. torch.inference_mode(): Replaced torch.no_grad() for a small additional
-#    speedup on inference calls (disables more autograd bookkeeping).
-#
-# 3. Heuristic cache (Dict[State, float]): Shared across both search phases.
-#    Avoids redundant nnet calls for states seen as successors from multiple
-#    parents. The batched heuristic function checks the cache first and only
-#    sends cache-misses through the nnet.
-#
-# 4. Phase 1 - Greedy via Q-values: Before running A*, attempt a greedy walk
-#    using Q(s,a) directly to pick actions. One nnet call on the current state
-#    gives Q-values for all actions; we try actions in descending Q-value order
-#    and take the first one leading to an unvisited state. This avoids expanding
-#    all successors (saving ~3 dynamics calls per step vs the h-based greedy).
-#    A quality gate rejects greedy solutions whose path cost exceeds
-#    1.5 * h(start) + 3, forcing those states into the A* phase.
-#
-# 5. Phase 2 - Weighted A* (W=5.0): For states where greedy fails or produces
-#    a path that's too long, fall back to weighted A* with f = g + 5*h. High
-#    weight aggressively steers search toward the goal, expanding far fewer
-#    nodes than standard A*. Tested W values from 1.0 to 10.0:
-#      W=1.0: ~8.4s, ~91% optimal (baseline)
-#      W=1.5: ~7.5s, ~85% optimal
-#      W=2.0: ~6.3s, ~80% optimal
-#      W=3.0: ~5.2s, ~73% optimal
-#      W=5.0: ~4.7s, ~69% optimal  <-- chosen
-#      W=10:  ~4.6s, ~68% optimal (diminishing returns)
-#
-# 6. Combined info dict: Merged best_g and parent dicts into a single
-#    info[state] = (best_g, parent_state, action) to halve dict lookups.
-#
-# Tested batch sizes (16 vs 64 -- 64 was slower due to over-expanding)
-# and greedy step limits (50, 100, 300 -- 300 with quality gate was best).
-# Profiling revealed JIT trace overhead was the single biggest bottleneck
-# (~2.5s), and that traced inference is only faster for batches >=16 (for
-# single-state calls in greedy, untraced is actually faster).
-#
-# Final result: ~2.3s avg, 100% solved, ~68% optimal (down from 8.4s).
+# Key optimizations:
+# 1. Tuple-based states: NPuzzleState uses numpy arrays (9 elements) for tiles,
+#    but numpy hash/eq/copy have massive per-call overhead for small arrays.
+#    We convert to tuples internally — native Python hash/eq is ~10x faster.
+# 2. Inlined tile swap: Instead of calling env.state_action_dynamics() which does
+#    np.stack, np.where, array.copy, fancy indexing for each transition, we
+#    pre-extract the swap table and do a direct tuple swap (~50x faster).
+# 3. torch.jit.trace with cross-call caching (avoids ~17ms trace per call).
+# 4. torch.inference_mode() over no_grad().
+# 5. Heuristic cache keyed on tuples.
+# 6. Phase 1 greedy via Q-values, Phase 2 weighted A* fallback.
+# 7. Batched nnet calls with one-hot encoding done in numpy.
 
 from typing import List, Tuple, Dict, Optional
 from environments.environment_abstract import Environment, State
@@ -54,8 +20,7 @@ from torch import nn
 import numpy as np
 import heapq
 
-# [OPT-1] Cache JIT-traced models across search() calls.
-# Tracing costs ~17ms and search() is called ~149 times = 2.5s of overhead.
+# Cache JIT-traced models across search() calls.
 _traced_nnet_cache: Dict[int, nn.Module] = {}
 
 
@@ -71,161 +36,189 @@ def search(env: Environment, state_start: State, nnet: nn.Module) -> Optional[Li
     if env.is_terminal(state_start):
         return []
 
-    # Cache attribute lookups to avoid repeated getattr overhead
-    states_to_input = env.states_to_nnet_input
-    is_terminal = env.is_terminal
-    get_actions = env.get_actions
-    dynamics = env.state_action_dynamics
+    # --- Extract puzzle-specific data for inlined transitions ---
+    # Pre-compute swap table: swap_table[zero_pos][action] = swap_pos
+    swap_zero_idxs = env.swap_zero_idxs  # shape (9, 4)
+    num_tiles = swap_zero_idxs.shape[0]
+    goal_tuple = tuple(range(num_tiles))
+    one_hot = np.eye(num_tiles, dtype=np.float32)
 
-    # [OPT-1] JIT-trace the nnet once, reuse across all search() calls
+    # Convert start state to tuple
+    start_t = tuple(int(x) for x in state_start.tiles)
+
+    # Pre-build swap table as nested tuple for fastest access
+    swap_table = tuple(
+        tuple(int(swap_zero_idxs[z, a]) for a in range(4))
+        for z in range(num_tiles)
+    )
+
+    # Find zero position helper — store in each tuple-state as (tiles_tuple, zero_pos)
+    # to avoid scanning for zero on every transition
+    start_zero = start_t.index(0)
+
+    def apply_action(tiles, zero_pos, action):
+        """Inline tile swap using tuples. Returns (new_tiles, new_zero_pos)."""
+        swap_pos = swap_table[zero_pos][action]
+        if swap_pos == zero_pos:
+            # No-op move (against wall)
+            return tiles, zero_pos
+        # Swap zero and target tile via list conversion
+        lst = list(tiles)
+        lst[zero_pos] = lst[swap_pos]
+        lst[swap_pos] = 0
+        return tuple(lst), swap_pos
+
+    # --- JIT trace nnet ---
     nnet_id = id(nnet)
     if nnet_id not in _traced_nnet_cache:
         try:
-            sample_input = torch.from_numpy(
-                np.asarray(states_to_input([state_start]), dtype=np.float32)
+            sample_input = one_hot[list(start_t)].reshape(1, -1)
+            _traced_nnet_cache[nnet_id] = torch.jit.trace(
+                nnet, torch.from_numpy(sample_input)
             )
-            _traced_nnet_cache[nnet_id] = torch.jit.trace(nnet, sample_input)
         except Exception:
             _traced_nnet_cache[nnet_id] = nnet
     traced_nnet = _traced_nnet_cache[nnet_id]
 
-    # [OPT-3] Heuristic cache -- avoids redundant nnet calls for repeated states
-    h_cache: Dict[State, float] = {}
+    # --- Heuristic with cache ---
+    h_cache: Dict[tuple, float] = {}
 
-    def heuristic_batch(states):
-        """Batch h-value computation with cache. Only sends cache-misses to nnet."""
-        results = [None] * len(states)
+    def tuples_to_nnet_input(tile_tuples):
+        """Convert list of tile tuples to nnet input (one-hot encoded)."""
+        states_np = np.array(tile_tuples, dtype=np.intp)
+        return one_hot[states_np].reshape(len(tile_tuples), -1)
+
+    def heuristic_batch(tile_tuples):
+        """Batch h-value computation with cache."""
+        results = [None] * len(tile_tuples)
         missing_indices = []
-        for i, s in enumerate(states):
-            h = h_cache.get(s)  # [OPT-3] check cache first
+        for i, t in enumerate(tile_tuples):
+            h = h_cache.get(t)
             if h is not None:
                 results[i] = h
             else:
                 missing_indices.append(i)
 
         if missing_indices:
-            missing_states = [states[i] for i in missing_indices]
-            nnet_input = np.asarray(states_to_input(missing_states), dtype=np.float32)
-            with torch.inference_mode():  # [OPT-2] inference_mode > no_grad
+            missing = [tile_tuples[i] for i in missing_indices]
+            nnet_input = tuples_to_nnet_input(missing)
+            with torch.inference_mode():
                 q_vals = traced_nnet(torch.from_numpy(nnet_input)).numpy()
             h_vals = -np.max(q_vals, axis=1)
             for j, idx in enumerate(missing_indices):
-                h_cache[states[idx]] = float(h_vals[j])  # [OPT-3] populate cache
-                results[idx] = float(h_vals[j])
+                h_val = float(h_vals[j])
+                h_cache[missing[j]] = h_val
+                results[idx] = h_val
 
         return results
 
-    h_start = heuristic_batch([state_start])[0]
+    h_start = heuristic_batch([start_t])[0]
 
-    # ---- [OPT-4] Phase 1: Greedy via Q-values ----
-    # Use Q(s,a) directly to rank actions (1 nnet call per step).
-    # Only calls dynamics on actions in Q-value order until an unvisited
-    # successor is found, saving ~3 dynamics calls/step vs expanding all.
-    # Quality gate: reject greedy solutions with path cost > 1.5 * h(start) + 3.
-    greedy_visited = {state_start}
+    # ---- Phase 1: Greedy via Q-values ----
+    greedy_visited = {start_t}
     greedy_path_actions = []
-    current = state_start
+    current_t = start_t
+    current_z = start_zero
     max_greedy_cost = 1.5 * h_start + 3
 
     for _ in range(300):
         if len(greedy_path_actions) > max_greedy_cost:
-            break  # quality gate: path too long, fall through to A*
+            break
 
-        # [OPT-4] Single nnet call gives Q-values for all actions at once
-        nnet_input = np.asarray(states_to_input([current]), dtype=np.float32)
-        with torch.inference_mode():  # [OPT-2]
-            q_vals = traced_nnet(torch.from_numpy(nnet_input)).numpy()[0]
+        # Single nnet call for Q-values (untraced is faster for batch=1)
+        nnet_input = tuples_to_nnet_input([current_t])
+        with torch.inference_mode():
+            q_vals = nnet(torch.from_numpy(nnet_input)).numpy()[0]
+        h_cache[current_t] = float(-np.max(q_vals))
 
-        actions = get_actions(current)
-        action_order = sorted(actions, key=lambda a: q_vals[a], reverse=True)
+        action_order = sorted(range(4), key=lambda a: q_vals[a], reverse=True)
 
         moved = False
         for action in action_order:
-            reward, next_states, probs = dynamics(current, action)
-            next_state = next_states[0] if len(next_states) == 1 else next_states[np.argmax(probs)]
+            next_t, next_z = apply_action(current_t, current_z, action)
 
-            if next_state in greedy_visited:
+            if next_t == current_t:  # no-op (wall)
+                continue
+            if next_t in greedy_visited:
                 continue
 
-            if is_terminal(next_state):
+            if next_t == goal_tuple:
                 greedy_path_actions.append(action)
                 if len(greedy_path_actions) <= max_greedy_cost:
-                    return greedy_path_actions  # quality gate passed
+                    return greedy_path_actions
                 moved = False
-                break  # quality gate failed, fall through to A*
+                break
 
             greedy_path_actions.append(action)
-            greedy_visited.add(next_state)
-            current = next_state
+            greedy_visited.add(next_t)
+            current_t = next_t
+            current_z = next_z
             moved = True
-            break  # took best unvisited action, next greedy step
+            break
 
         if not moved:
-            break  # dead end or quality gate failed
+            break
 
-    # ---- [OPT-5] Phase 2: Weighted A* fallback (W=5.0) ----
-    # f = g + W*h aggressively steers toward goal, expanding far fewer nodes.
+    # ---- Phase 2: Weighted A* fallback (W=5.0) ----
     W = 5.0
 
-    # [OPT-6] Combined dict: info[state] = (best_g, parent_state, action)
-    # Merges best_g and parent tracking into one dict to halve lookups.
-    info: Dict[State, Tuple[float, Optional[State], int]] = {state_start: (0.0, None, -1)}
+    # info[tiles_tuple] = (best_g, parent_tuple, parent_zero, action)
+    info: Dict[tuple, Tuple[float, Optional[tuple], int, int]] = {
+        start_t: (0.0, None, start_zero, -1)
+    }
 
     counter = 0
-    open_list = [(W * h_start, -0.0, counter, state_start)]
-    BATCH_SIZE = 16  # tested 64 -- slower due to over-expanding
+    open_list = [(W * h_start, -0.0, counter, start_t, start_zero)]
+    BATCH_SIZE = 16
 
     while open_list:
-        # Pop up to BATCH_SIZE nodes to expand together (amortizes nnet calls)
         batch_nodes = []
         while open_list and len(batch_nodes) < BATCH_SIZE:
-            _, neg_g, _, state = heapq.heappop(open_list)
+            _, neg_g, _, tiles, zero_pos = heapq.heappop(open_list)
             g = -neg_g
-            entry = info.get(state)
+            entry = info.get(tiles)
             if entry is None or g > entry[0]:
-                continue  # stale entry, skip
-            batch_nodes.append((g, state))
+                continue
+            batch_nodes.append((g, tiles, zero_pos))
 
         if not batch_nodes:
             continue
 
-        # Expand all batch nodes, collect successor candidates for one nnet call
         all_candidates = []
-        for g, state in batch_nodes:
-            for action in get_actions(state):
-                reward, next_states, probs = dynamics(state, action)
-                next_state = next_states[0] if len(next_states) == 1 else next_states[np.argmax(probs)]
-                new_g = g - reward
+        for g, tiles, zero_pos in batch_nodes:
+            for action in range(4):
+                next_t, next_z = apply_action(tiles, zero_pos, action)
+                if next_t == tiles:  # no-op
+                    continue
+                new_g = g + 1.0  # each move costs 1
 
-                entry = info.get(next_state)
+                entry = info.get(next_t)
                 if entry is not None and new_g >= entry[0]:
-                    continue  # already have equal or better path
-                info[next_state] = (new_g, state, action)  # [OPT-6]
+                    continue
+                info[next_t] = (new_g, tiles, zero_pos, action)
 
-                if is_terminal(next_state):
-                    # Reconstruct path via parent pointers
+                if next_t == goal_tuple:
+                    # Reconstruct path
                     actions_list = []
-                    s = next_state
-                    while s is not state_start:
-                        _, ps, a = info[s]
+                    s = next_t
+                    while s != start_t:
+                        _, ps, pz, a = info[s]
                         actions_list.append(a)
                         s = ps
                     actions_list.reverse()
                     return actions_list
 
-                all_candidates.append((action, next_state, new_g, state))
+                all_candidates.append((next_t, next_z, new_g, tiles))
 
         if all_candidates:
-            # [OPT-3] Batch heuristic call with cache for all candidates at once
-            candidate_states = [c[1] for c in all_candidates]
-            h_vals = heuristic_batch(candidate_states)
-            for j, (action, next_state, new_g, par_state) in enumerate(all_candidates):
-                entry = info.get(next_state)
+            candidate_tuples = [c[0] for c in all_candidates]
+            h_vals = heuristic_batch(candidate_tuples)
+            for j, (next_t, next_z, new_g, par_t) in enumerate(all_candidates):
+                entry = info.get(next_t)
                 if entry is not None and new_g > entry[0]:
-                    continue  # another candidate in batch found a better path
-                info[next_state] = (new_g, par_state, action)  # [OPT-6]
+                    continue
                 counter += 1
-                f = new_g + W * h_vals[j]  # [OPT-5] weighted f-value
-                heapq.heappush(open_list, (f, -new_g, counter, next_state))
+                f = new_g + W * h_vals[j]
+                heapq.heappush(open_list, (f, -new_g, counter, next_t, next_z))
 
     return None
